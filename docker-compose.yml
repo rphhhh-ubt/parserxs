@@ -1,0 +1,28 @@
+version: '3.8'
+
+services:
+  bot:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: aiogram-playwright-bot
+    env_file:
+      - .env
+    environment:
+      - BOT_TOKEN=${BOT_TOKEN}
+      - LOG_LEVEL=${LOG_LEVEL:-INFO}
+      - PLAYWRIGHT_TIMEOUT=${PLAYWRIGHT_TIMEOUT:-30000}
+      - LOCALE=${LOCALE:-en-US}
+    volumes:
+      # Mount source code for development (comment out for production)
+      - ./bot.py:/app/bot.py
+      - ./logs:/app/logs
+    restart: unless-stopped
+    # Uncomment for debugging
+    # command: python bot.py
+    healthcheck:
+      test: ["CMD", "python", "-c", "import sys; sys.exit(0)"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 5s
