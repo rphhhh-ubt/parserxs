@@ -1,16 +1,11 @@
-import asyncio
-import logging
-import os
 from aiogram import Bot, Dispatcher, F
 from aiogram.filters import Command
-from aiogram.types import Message
-from playwright.async_api import async_playwright
+from aiogram.types import Message, CallbackQuery, ReplyKeyboardMarkup, KeyboardButton, InlineKeyboardMarkup, InlineKeyboardButton, BufferedInputFile
+import asyncio
+import os
+from parser import search_product, get_prices_by_stores
+from excel_gen import create_excel
 
-logging.basicConfig(
-    level=os.getenv("LOG_LEVEL", "INFO"),
-    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s"
-)
-logger = logging.getLogger(__name__)
 
 bot = Bot(token=os.getenv("BOT_TOKEN"))
 dp = Dispatcher()
@@ -18,81 +13,104 @@ dp = Dispatcher()
 
 @dp.message(Command("start"))
 async def cmd_start(message: Message):
+    keyboard = ReplyKeyboardMarkup(
+        keyboard=[[KeyboardButton(text="🔍 Искать в Ленте")]],
+        resize_keyboard=True
+    )
     await message.answer(
-        "Welcome! I'm a bot with Playwright capabilities.\n\n"
-        "Commands:\n"
-        "/start - Show this message\n"
-        "/screenshot <url> - Take a screenshot of a URL\n"
-        "/health - Check bot health"
+        "Привет! Я помогу найти товары в Ленте и сравнить цены по магазинам.\n\n"
+        "Нажми кнопку ниже, чтобы начать поиск.",
+        reply_markup=keyboard
     )
 
 
-@dp.message(Command("health"))
-async def cmd_health(message: Message):
-    try:
-        async with async_playwright() as p:
-            browser = await p.chromium.launch(headless=True)
-            await browser.close()
-        await message.answer("✅ Bot is healthy! Playwright is working correctly.")
-    except Exception as e:
-        logger.error(f"Health check failed: {e}")
-        await message.answer(f"❌ Health check failed: {str(e)}")
+@dp.message(F.text == "🔍 Искать в Ленте")
+async def search_button_handler(message: Message):
+    await message.answer("Введите название товара для поиска:")
 
 
-@dp.message(Command("screenshot"))
-async def cmd_screenshot(message: Message):
-    if not message.text or len(message.text.split()) < 2:
-        await message.answer("Please provide a URL. Usage: /screenshot <url>")
+@dp.message(F.text)
+async def search_text_handler(message: Message):
+    if not message.text or message.text.startswith("/"):
         return
     
-    url = message.text.split(maxsplit=1)[1]
-    
-    if not url.startswith(("http://", "https://")):
-        url = "https://" + url
-    
-    status_msg = await message.answer("⏳ Taking screenshot...")
+    query = message.text
+    status_msg = await message.answer("🔍 Ищу товары...")
     
     try:
-        timeout = int(os.getenv("PLAYWRIGHT_TIMEOUT", "30000"))
+        products = await search_product(query)
         
-        async with async_playwright() as p:
-            browser = await p.chromium.launch(
-                headless=True,
-                args=[
-                    "--no-sandbox",
-                    "--disable-setuid-sandbox",
-                    "--disable-dev-shm-usage",
-                    "--disable-accelerated-2d-canvas",
-                    "--disable-gpu"
-                ]
-            )
-            context = await browser.new_context(
-                viewport={"width": 1280, "height": 720},
-                locale=os.getenv("LOCALE", "en-US")
-            )
-            page = await context.new_page()
-            
-            await page.goto(url, timeout=timeout, wait_until="networkidle")
-            screenshot_bytes = await page.screenshot(full_page=False)
-            
-            await browser.close()
+        if not products:
+            await status_msg.edit_text("Товары не найдены. Попробуйте изменить запрос.")
+            return
         
-        await message.answer_photo(
-            photo=screenshot_bytes,
-            caption=f"Screenshot of {url}"
+        keyboard_buttons = []
+        for product in products[:10]:
+            product_name = product["name"]
+            volume = product.get("volume", "")
+            button_text = f"{product_name}"
+            if volume:
+                button_text += f" {volume}"
+            
+            if len(button_text) > 64:
+                button_text = button_text[:61] + "..."
+            
+            keyboard_buttons.append([
+                InlineKeyboardButton(
+                    text=button_text,
+                    callback_data=f"product:{product['id']}"
+                )
+            ])
+        
+        keyboard = InlineKeyboardMarkup(inline_keyboard=keyboard_buttons)
+        await status_msg.edit_text(
+            f"Найдено товаров: {len(products)}\nВыберите товар для получения цен:",
+            reply_markup=keyboard
         )
-        await status_msg.delete()
         
     except Exception as e:
-        logger.error(f"Screenshot failed for {url}: {e}")
-        await status_msg.edit_text(f"❌ Failed to take screenshot: {str(e)}")
+        await status_msg.edit_text(f"Ошибка при поиске: {str(e)}")
+
+
+@dp.callback_query(F.data.startswith("product:"))
+async def product_callback_handler(callback: CallbackQuery):
+    await callback.answer()
+    
+    product_id = callback.data.split(":", 1)[1]
+    
+    status_msg = await callback.message.edit_text("⏳ Собираю цены по магазинам...")
+    
+    try:
+        prices = await get_prices_by_stores(product_id)
+        
+        if not prices:
+            await status_msg.edit_text("Не удалось получить цены для этого товара.")
+            return
+        
+        product_name = callback.message.text.split("\n")[0] if callback.message.text else "Товар"
+        
+        try:
+            excel_data = create_excel(product_name, prices)
+            
+            file = BufferedInputFile(excel_data, filename=f"{product_name[:50]}.xlsx")
+            
+            await callback.message.answer_document(
+                document=file,
+                caption=f"📊 Цены для товара: {product_name}\n"
+                        f"Найдено магазинов: {len(prices)}"
+            )
+            
+            await status_msg.edit_text("✅ Готово! Файл отправлен выше.")
+            
+        except Exception as e:
+            await status_msg.edit_text(f"Ошибка при создании Excel: {str(e)}")
+            
+    except Exception as e:
+        await status_msg.edit_text(f"Ошибка при получении цен: {str(e)}")
 
 
 async def main():
-    logger.info("Starting bot...")
-    
     if not os.getenv("BOT_TOKEN"):
-        logger.error("BOT_TOKEN environment variable is not set!")
         raise ValueError("BOT_TOKEN is required")
     
     try:
@@ -105,4 +123,4 @@ if __name__ == "__main__":
     try:
         asyncio.run(main())
     except (KeyboardInterrupt, SystemExit):
-        logger.info("Bot stopped")
+        print("Bot stopped")
